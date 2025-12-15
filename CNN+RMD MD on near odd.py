@@ -98,14 +98,32 @@ class ResNet18(nn.Module):
         return feat, logits
 
 # =========================================================
-# 2) Numerically stable SPD inverse
+# 2) Numerically stable SPD inverse (robust)
 # =========================================================
-def spd_inverse(A):
+def spd_inverse(A, jitter_eps=1e-6):
+    """
+    Robust inverse for symmetric positive (semi-)definite A.
+    Tries Cholesky, else SVD pseudo-inverse with threshold, else add larger jitter and invert.
+    Returns a finite tensor (nan/inf cleaned).
+    """
+    A_sym = 0.5 * (A + A.t())
+    dtype = A_sym.dtype
+    device = A_sym.device
     try:
-        L = torch.linalg.cholesky(A)
-        return torch.cholesky_inverse(L)
-    except RuntimeError:
-        return torch.inverse(A)
+        L = torch.linalg.cholesky(A_sym)
+        inv = torch.cholesky_inverse(L)
+    except Exception:
+        try:
+            U, S, Vh = torch.linalg.svd(A_sym, full_matrices=False)
+            tol = max(A_sym.shape) * S.max() * torch.finfo(S.dtype).eps
+            S_inv = torch.where(S > tol, 1.0 / S, torch.zeros_like(S))
+            inv = (Vh.t() * S_inv.unsqueeze(0)).matmul(U.t())
+        except Exception:
+            I = torch.eye(A_sym.shape[0], device=device, dtype=dtype)
+            inv = torch.linalg.inv(A_sym + max(jitter_eps, 1e-3) * I)
+
+    inv = torch.nan_to_num(inv, nan=0.0, posinf=1e6, neginf=-1e6)
+    return inv
 
 # =========================================================
 # 3) Extract feats/logits (device-safe) + optional L2 norm
@@ -144,10 +162,10 @@ class LLLA_Fitter:
         self.global_mean = None     # (d,)
         self.global_cov_inv = None  # (d,d)
 
-        # ID statistics for normalization
-        # 使用标准 Mahalanobis (min_k) 的统计量
+        # ID statistics for normalization (per-mode)
         self.maha_id_mean = None
         self.maha_id_std = None
+        self.maha_stats = None
 
     def fit(self, features, logits, labels):
         device = features.device
@@ -189,8 +207,12 @@ class LLLA_Fitter:
         cov_global = cov_global + self.jitter * torch.eye(d, device=device)
         self.global_cov_inv = spd_inverse(cov_global)
 
+        # Clean up NaN/Inf
+        self.posterior_cov = torch.nan_to_num(self.posterior_cov, nan=0.0, posinf=1e6, neginf=-1e6)
+        self.shared_cov_inv = torch.nan_to_num(self.shared_cov_inv, nan=0.0, posinf=1e6, neginf=-1e6)
+        self.global_cov_inv = torch.nan_to_num(self.global_cov_inv, nan=0.0, posinf=1e6, neginf=-1e6)
+
         # --- 4. Compute ID Mahalanobis Statistics (using min_k, not pred) ---
-        # 计算每个样本到所有类的马氏距离，取最小值
         all_d_cls = []
         for c in range(self.num_classes):
             diff = features - self.class_means[c]
@@ -203,21 +225,29 @@ class LLLA_Fitter:
         diff_glob = features - self.global_mean
         d_glob = (diff_glob.matmul(self.global_cov_inv) * diff_glob).sum(dim=1)
 
-        # 标准 Mahalanobis (不是 RMD): 只用 min_k D_class
-        # 这个统计量用于归一化
-        self.maha_id_mean = float(min_d_cls.mean().item())
-        self.maha_id_std  = float(min_d_cls.std(unbiased=False).item())
-        if self.maha_id_std < 1e-6:
-            self.maha_id_std = 1.0
+        # --- store per-mode ID statistics ---
+        min_mean = float(min_d_cls.mean().item())
+        min_std  = float(min_d_cls.std(unbiased=False).item())
+        if min_std < 1e-6:
+            min_std = 1.0
 
-        print(f"[Info] Min-class Maha stats on ID: mean={self.maha_id_mean:.4f}, std={self.maha_id_std:.4f}")
-        
-        # 也计算 RMD 统计量用于对比
-        rmd_scores = min_d_cls - d_glob
-        rmd_mean = float(rmd_scores.mean().item())
-        rmd_std = float(rmd_scores.std(unbiased=False).item())
+        rmd = (min_d_cls - d_glob)
+        rmd_mean = float(rmd.mean().item())
+        rmd_std  = float(rmd.std(unbiased=False).item())
+        if rmd_std < 1e-6:
+            rmd_std = 1.0
+
+        self.maha_stats = {
+            'min_class': (min_mean, min_std),
+            'rmd_min':   (rmd_mean, rmd_std),
+        }
+
+        self.maha_id_mean = min_mean
+        self.maha_id_std  = min_std
+
+        print(f"[Info] Min-class Maha stats on ID: mean={min_mean:.4f}, std={min_std:.4f}")
         print(f"[Info] RMD (min_k) stats on ID: mean={rmd_mean:.4f}, std={rmd_std:.4f}")
-        
+
         print("[-] Fit complete.")
 
 # =========================================================
@@ -261,7 +291,6 @@ class Predictor:
         N = features.shape[0]
         K = self.fitter.num_classes
         
-        # Compute D_class for all classes
         all_d_cls = []
         for c in range(K):
             diff = features - self.fitter.class_means[c]
@@ -269,40 +298,29 @@ class Predictor:
             all_d_cls.append(d_c)
         all_d_cls = torch.stack(all_d_cls, dim=1)  # (N, K)
         
-        # Compute D_global
         diff_glob = features - self.fitter.global_mean
         d_glob = (diff_glob.matmul(self.fitter.global_cov_inv) * diff_glob).sum(dim=1)
         
         if self.maha_mode == "min_class":
-            # Standard Mahalanobis: min_k D_k(x)
-            # Higher = further from all classes = more OOD
             score = all_d_cls.min(dim=1)[0]
             
         elif self.maha_mode == "pred_class":
-            # Predicted class Mahalanobis
             pred = logits.argmax(dim=1)
             score = all_d_cls[torch.arange(N, device=features.device), pred]
             
         elif self.maha_mode == "rmd_min":
-            # RMD with min_k: min_k(D_k - D_0) = min_k(D_k) - D_0
             min_d_cls = all_d_cls.min(dim=1)[0]
             score = min_d_cls - d_glob
             
         elif self.maha_mode == "rmd_pred":
-            # RMD with predicted class
             pred = logits.argmax(dim=1)
             d_pred = all_d_cls[torch.arange(N, device=features.device), pred]
             score = d_pred - d_glob
             
-        elif self.maha_mode == "neg_rmd_min":
-            # Negative RMD: -RMD = D_0 - min_k(D_k)
-            # 当 OOD 在背景分布中也远离时，D_0 大，-RMD 大
-            min_d_cls = all_d_cls.min(dim=1)[0]
-            score = d_glob - min_d_cls
-            
         else:
             raise ValueError(f"Unknown maha_mode: {self.maha_mode}")
         
+        score = torch.nan_to_num(score, nan=0.0, posinf=1e6, neginf=-1e6)
         return score.unsqueeze(1)  # (N, 1)
 
     def maha_norm_score(self, features, logits):
@@ -310,32 +328,47 @@ class Predictor:
         Returns normalized Mahalanobis score.
         Higher = more OOD-like
         """
-        raw_score = self.compute_maha_score(features, logits).squeeze(1)
-        
+        raw_score = self.compute_maha_score(features, logits).squeeze(1)  # tensor on device
+
         if not self.normalize_maha:
             return raw_score.unsqueeze(1)
-        
-        # Normalize using ID statistics
-        m = self.fitter.maha_id_mean
-        s = self.fitter.maha_id_std
-        z = (raw_score - m) / s
-        
-        # 只惩罚比典型 ID 更远的样本
-        z = torch.clamp(z, min=0.0)
+
+        if hasattr(self.fitter, "maha_stats") and (self.maha_mode in self.fitter.maha_stats):
+            m, s = self.fitter.maha_stats[self.maha_mode]
+        else:
+            m, s = getattr(self.fitter, "maha_id_mean", 0.0), getattr(self.fitter, "maha_id_std", 1.0)
+
+        m_t = torch.tensor(m, device=raw_score.device, dtype=raw_score.dtype)
+        s_t = torch.tensor(s, device=raw_score.device, dtype=raw_score.dtype)
+
+        if s_t == 0:
+            s_t = torch.tensor(1.0, device=raw_score.device, dtype=raw_score.dtype)
+
+        z = (raw_score - m_t) / s_t
+
+        # KEEP sign information (do not clamp here). We use absolute-value based beta later for stability.
+        z = torch.nan_to_num(z, nan=0.0, posinf=1e6, neginf=-1e6)
         return z.unsqueeze(1)
 
     @torch.no_grad()
     def conf(self, features, logits):
         self._ensure_device(features.device)
         
-        v_llla = self.llla_var(features)
+        v_llla = self.llla_var(features)  # (N,1)
         
-        # Mahalanobis penalty
         geo = self.beta * self.maha_norm_score(features, logits) if self.beta != 0.0 else 0.0
         
-        sigma_total = v_llla + geo
+        if isinstance(geo, float) and geo == 0.0:
+            sigma_total = v_llla
+        else:
+            sigma_total = v_llla + geo
+
+        sigma_total = torch.nan_to_num(sigma_total, nan=1e6, posinf=1e6, neginf=0.0)
+        sigma_total = torch.clamp(sigma_total, min=0.0)
+
         kappa = 1.0 / torch.sqrt(1.0 + (self.pi / 8.0) * sigma_total)
-        
+        kappa = torch.nan_to_num(kappa, nan=0.0, posinf=1.0, neginf=0.0)
+
         mod_logits = logits * kappa
         probs = torch.softmax(mod_logits, dim=1)
         conf = probs.max(dim=1)[0]
@@ -347,11 +380,13 @@ class Predictor:
         return self.compute_maha_score(features, logits).squeeze(1).cpu().numpy()
 
 # =========================================================
-# 6) AutoBeta: match magnitudes on ID
+# 6) AutoBeta: robust (abs-based) + cap
 # =========================================================
 def auto_beta_from_id(fitter, feat_id, logits_id, alpha=1.0, maha_mode="min_class", 
                       normalize_maha=True, stat="median"):
-    """Choose beta so that stat(llla_var) ≈ beta * stat(maha_norm) on ID."""
+    """Choose beta so that stat(llla_var) ≈ beta * stat(maha_norm) on ID.
+       Use absolute-value based stat for robustness and cap beta.
+    """
     pred0 = Predictor(fitter, alpha=alpha, beta=0.0, maha_mode=maha_mode, 
                       normalize_maha=normalize_maha)
 
@@ -362,32 +397,32 @@ def auto_beta_from_id(fitter, feat_id, logits_id, alpha=1.0, maha_mode="min_clas
         v_llla = pred0.llla_var(feat_id).squeeze(1)
         maha_norm = pred0.maha_norm_score(feat_id, logits_id).squeeze(1)
 
-        # Only align on samples where penalty is active (>0)
-        mask = (maha_norm > 0)
-        n = int(mask.sum().item())
-        print(f"[AutoBeta] mode={maha_mode}, stat={stat}, samples with score>0: n={n}")
+        # mask finite
+        mask = torch.isfinite(maha_norm) & torch.isfinite(v_llla)
+        if mask.sum().item() == 0:
+            print("[AutoBeta] No finite samples; fallback beta=0.5")
+            return 0.5
 
-        if n < 100:
-            print("[AutoBeta] Too few samples with score>0; fallback beta=0.1")
-            return 0.1
+        maha_vals = maha_norm[mask].detach().cpu().numpy()
+        v_vals = v_llla[mask].detach().cpu().numpy()
 
-        v = v_llla[mask].detach().cpu().numpy()
-        m = maha_norm[mask].detach().cpu().numpy()
-
+        # use absolute magnitude for matching to be robust to sign
         if stat == "mean":
-            a = float(np.mean(v))
-            b = float(np.mean(m))
+            a = float(np.mean(v_vals))
+            b = float(np.mean(np.abs(maha_vals)))
         else:
-            a = float(np.median(v))
-            b = float(np.median(m))
+            a = float(np.median(v_vals))
+            b = float(np.median(np.abs(maha_vals)))
 
         if b <= 1e-12:
-            print("[AutoBeta] Maha statistic too small; fallback beta=0.1")
-            return 0.1
+            beta = 0.5
+        else:
+            beta = a / b
 
-        beta = a / b
-        print(f"[AutoBeta] {stat}(llla_var)={a:.6f}, {stat}(maha_score)={b:.6f} => beta={beta:.6f}")
-        return float(beta)
+        # cap beta to avoid runaway scaling
+        beta = float(np.clip(beta, 0.05, 3.0))
+        print(f"[AutoBeta] mode={maha_mode}, stat={stat}, a={a:.6f}, b={b:.6f}, beta={beta:.6f}")
+        return beta
 
 # =========================================================
 # 7) PGD attack
@@ -504,7 +539,7 @@ def main():
     WEIGHT_PATH = "resnet18_cifar10_weights.pth"
     TAU = 1e-4
     JITTER = 1e-6
-    L2_NORM_FEATURE =   False
+    L2_NORM_FEATURE =   False  # Keep FALSE for high-magnitude detection
     NORM_MAHA = True
 
     PURE_ALPHA = 1.0
@@ -518,7 +553,7 @@ def main():
     # -------------------------
 
     print("\n" + "="*70)
-    print("     FIXED RMD Implementation - Multiple Modes Comparison")
+    print("      RMD-Focused Implementation - All Modes on Attack")
     print("="*70)
     print(f"DEVICE={DEVICE}")
 
@@ -585,46 +620,62 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    # ----------------- Quick check for experiment -----------------
+    print("\n[Debug] Inspect per-mode raw and normalized scores on ID")
+    feat_id_dbg, logits_id_dbg, _ = extract_all(model, id_loader, DEVICE, l2_normalize=L2_NORM_FEATURE)
+
+    pred_dbg = Predictor(fitter, alpha=1.0, beta=0.0, maha_mode="min_class", normalize_maha=False)
+    raw_min = pred_dbg.get_maha_scores(feat_id_dbg, logits_id_dbg)
+    pred_dbg.maha_mode = "rmd_min"
+    raw_rmd = pred_dbg.get_maha_scores(feat_id_dbg, logits_id_dbg)
+
+    import numpy as _np
+    print("Raw stats (min_class): mean={:.4f}, std={:.4f}, >0_frac={:.4f}".format(
+        float(_np.mean(raw_min)), float(_np.std(raw_min)), float((_np.array(raw_min)>0).mean())))
+    print("Raw stats (rmd_min): mean={:.4f}, std={:.4f}, >0_frac={:.4f}".format(
+        float(_np.mean(raw_rmd)), float(_np.std(raw_rmd)), float((_np.array(raw_rmd)>0).mean())))
+
+    pred2 = Predictor(fitter, alpha=1.0, beta=0.0, maha_mode="rmd_min", normalize_maha=True)
+    z_rmd = pred2.maha_norm_score(feat_id_dbg, logits_id_dbg).squeeze(1).cpu().numpy()
+
+    print("Normed stats (rmd_min): mean={:.4f}, std={:.4f}, >0_frac={:.4f}".format(
+        float(_np.mean(z_rmd)), float(_np.std(z_rmd)), float((_np.array(z_rmd)>0).mean())))
+    # ----------------- End debug -----------------
+
     # Extract ID
     print("\n--- Extract ID test feats/logits ---")
-    feat_id, logits_id, y_id = extract_all(model, id_loader, DEVICE, l2_normalize=L2_NORM_FEATURE)
+    feat_id, logits_id, y_id = feat_id_dbg, logits_id_dbg, None  # reuse extracted ones
 
     id_acc = evaluate_accuracy(model, id_loader, DEVICE)
     print(f"\n[ID] test accuracy: {id_acc:.2f}%")
 
     # =========================================================
-    # Test multiple modes
+    # Test multiple modes on OOD sets
     # =========================================================
-    modes_to_test = ["min_class", "rmd_min", "neg_rmd_min"]
-    
-    results = {}
-    
+    modes_to_test = ["min_class", "rmd_min"]
+    results_summary = {}
+
+    print("\n" + "="*70)
+    print("                  OOD Evaluation")
+    print("="*70)
+
     for mode in modes_to_test:
-        print(f"\n{'='*60}")
-        print(f"  Testing mode: {mode}")
-        print(f"{'='*60}")
-        
-        # Auto beta
+        print(f"\n=== Mode: {mode} ===")
         beta = auto_beta_from_id(fitter, feat_id, logits_id, alpha=HYB_ALPHA, 
-                                  maha_mode=mode, normalize_maha=NORM_MAHA, stat="median")
-        
-        # Predictors
+                                 maha_mode=mode, normalize_maha=NORM_MAHA, stat="median")
+        results_summary[mode] = {"beta": beta}
+
         pure = Predictor(fitter, alpha=PURE_ALPHA, beta=0.0, maha_mode=mode, normalize_maha=NORM_MAHA)
         hyb  = Predictor(fitter, alpha=HYB_ALPHA, beta=beta, maha_mode=mode, normalize_maha=NORM_MAHA)
 
-        # ID scores
         id_msp  = msp_confidence_from_logits(logits_id)
         id_pure = pure.conf(feat_id, logits_id)
         id_hyb  = hyb.conf(feat_id, logits_id)
 
         print(f"[Hybrid] auto beta = {beta:.6f}")
-        
-        results[mode] = {"beta": beta}
-
-        # OOD evaluation
         print(f"\n{'OOD set':<15} | {'MSP':>8} | {'Pure':>8} | {'Hybrid':>8}")
         print("-"*50)
-        
+
         for name, loader in ood_loaders.items():
             feat_ood, logits_ood, _ = extract_all(model, loader, DEVICE, l2_normalize=L2_NORM_FEATURE)
 
@@ -634,47 +685,18 @@ def main():
 
             au_msp  = auroc_id_vs_ood(id_msp,  ood_msp)
             au_pure = auroc_id_vs_ood(id_pure, ood_pure)
-            au_hyb  = auroc_id_vs_ood(id_hyb,  ood_hyb)
-            
-            results[mode][name] = {"msp": au_msp, "pure": au_pure, "hybrid": au_hyb}
+            au_hyb  = auroc_id_vs_ood(id_hyb, ood_hyb)
+
             print(f"{name:<15} | {au_msp:8.4f} | {au_pure:8.4f} | {au_hyb:8.4f}")
 
     # =========================================================
-    # Summary comparison
+    # Attack Evaluation (All Modes)
     # =========================================================
     print("\n" + "="*70)
-    print("                    SUMMARY COMPARISON")
+    print("                  Attack Evaluation (PGD)")
     print("="*70)
-    print(f"{'OOD':<12} | {'MSP':>7} | ", end="")
-    for mode in modes_to_test:
-        print(f"{mode[:8]:>10} | ", end="")
-    print()
-    print("-"*70)
-    
-    for ood_name in ood_loaders.keys():
-        msp_val = results[modes_to_test[0]][ood_name]["msp"]
-        print(f"{ood_name:<12} | {msp_val:7.4f} | ", end="")
-        for mode in modes_to_test:
-            hyb_val = results[mode][ood_name]["hybrid"]
-            # Mark best with *
-            print(f"{hyb_val:10.4f} | ", end="")
-        print()
 
-    # Attack evaluation (only for best mode)
-    print("\n" + "="*60)
-    print("  Attack Evaluation (using min_class mode)")
-    print("="*60)
-    
-    best_mode = "min_class"
-    beta = results[best_mode]["beta"]
-    pure = Predictor(fitter, alpha=PURE_ALPHA, beta=0.0, maha_mode=best_mode, normalize_maha=NORM_MAHA)
-    hyb  = Predictor(fitter, alpha=HYB_ALPHA, beta=beta, maha_mode=best_mode, normalize_maha=NORM_MAHA)
-    
-    id_msp  = msp_confidence_from_logits(logits_id)
-    id_pure = pure.conf(feat_id, logits_id)
-    id_hyb  = hyb.conf(feat_id, logits_id)
-    
-    print(f"[Attack] PGD eps={ATTACK_EPS:.5f}, steps={ATTACK_STEPS}")
+    print(f"[Attack] Generating PGD samples (eps={ATTACK_EPS:.5f}, steps={ATTACK_STEPS})...")
     feat_adv, logits_adv, _ = extract_attack(
         model, id_loader, DEVICE,
         l2_normalize=L2_NORM_FEATURE,
@@ -682,15 +704,30 @@ def main():
         max_batches=ATTACK_MAX_BATCHES
     )
 
-    adv_msp  = msp_confidence_from_logits(logits_adv)
-    adv_pure = pure.conf(feat_adv, logits_adv)
-    adv_hyb  = hyb.conf(feat_adv, logits_adv)
+    adv_msp = msp_confidence_from_logits(logits_adv)
+    id_msp_final = msp_confidence_from_logits(logits_id)
 
-    print(f"\n{'Attack':<15} | {'MSP':>8} | {'Pure':>8} | {'Hybrid':>8}")
+    print(f"\n{'Mode':<15} | {'MSP':>8} | {'Pure':>8} | {'Hybrid':>8}")
     print("-"*50)
-    print(f"{'PGD':<15} | {auroc_id_vs_ood(id_msp, adv_msp):8.4f} | "
-          f"{auroc_id_vs_ood(id_pure, adv_pure):8.4f} | "
-          f"{auroc_id_vs_ood(id_hyb, adv_hyb):8.4f}")
+
+    for mode in modes_to_test:
+        beta = results_summary[mode]["beta"]
+
+        pure = Predictor(fitter, alpha=PURE_ALPHA, beta=0.0, maha_mode=mode, normalize_maha=NORM_MAHA)
+        hyb  = Predictor(fitter, alpha=HYB_ALPHA, beta=beta, maha_mode=mode, normalize_maha=NORM_MAHA)
+
+        id_pure = pure.conf(feat_id, logits_id)
+        id_hyb  = hyb.conf(feat_id, logits_id)
+
+        adv_pure = pure.conf(feat_adv, logits_adv)
+        adv_hyb  = hyb.conf(feat_adv, logits_adv)
+
+        au_msp  = auroc_id_vs_ood(id_msp_final, adv_msp)
+        au_pure = auroc_id_vs_ood(id_pure, adv_pure)
+        au_hyb  = auroc_id_vs_ood(id_hyb, adv_hyb)
+
+        print(f"{mode:<15} | {au_msp:8.4f} | {au_pure:8.4f} | {au_hyb:8.4f}")
 
 if __name__ == "__main__":
     main()
+
